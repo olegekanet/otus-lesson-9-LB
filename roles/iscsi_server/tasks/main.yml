@@ -1,0 +1,111 @@
+---
+- name: Ensure LIO packages are installed
+  apt:
+    name: targetcli-fb
+    state: present
+    update_cache: yes
+
+- name: Set hostname to iscsi
+  hostname:
+    name: iscsi
+
+- name: Update /etc/hosts with new hostname
+  lineinfile:
+    path: /etc/hosts
+    regexp: '^(127\.0\.1\.1\s+).*'
+    line: '127.0.1.1   iscsi'
+    state: present
+
+- name: Create partition on "{{ iscsi_device_server }}"
+  parted:
+    device: "{{ iscsi_device_server }}"
+    number: 1
+    part_type: primary
+    state: present
+    part_start: "0%"
+    part_end: "100%"
+    unit: "%"
+
+- name: Wait for the partition to be available
+  command: udevadm settle
+  become: yes
+
+- name: Display partition information for "{{ iscsi_device_server }}"
+  command: fdisk -l "{{ iscsi_device_server }}"
+  register: partition_info
+  become: yes
+
+- name: Debug partition information
+  debug:
+    var: partition_info.stdout
+
+- name: Check if filesystem exists on {{ iscsi_device_server }}1
+  command: blkid {{ iscsi_device_server }}1
+  register: fs_check
+  ignore_errors: yes
+  become: yes
+
+- name: Create filesystem on {{ iscsi_device_server }}1
+  command: mkfs.ext4 {{ iscsi_device_server }}1
+  become: yes
+  when: fs_check.rc != 0
+
+- name: Display filesystem information for {{ iscsi_device_server }}1
+  command: lsblk -f {{ iscsi_device_server }}1
+  register: fs_info
+  become: yes
+
+- name: Debug filesystem information
+  debug:
+    var: fs_info.stdout
+
+- name: Check if block backstore exists
+  command: targetcli backstores/block ls
+  register: block_backstore_check
+  ignore_errors: yes
+  become: yes
+
+- name: Debug block backstore check
+  debug:
+    var: block_backstore_check.stdout
+
+- name: Create block backstore in LIO
+  command: targetcli backstores/block create name=disk0 dev="{{ iscsi_device_server }}"1
+  become: yes
+  when: "'disk0' not in block_backstore_check.stdout"
+
+- name: Create iSCSI target in LIO
+  command: targetcli iscsi/ create "{{ iscsi_target_iqn }}"
+  become: yes
+
+- name: Create LUN in LIO
+  command: targetcli /iscsi/{{ iscsi_target_iqn }}/tpg1/luns create /backstores/block/disk0
+  become: yes
+
+- name: Set authentication
+  command: targetcli  /iscsi/{{ iscsi_target_iqn }}/tpg1  set attribute authentication=0
+  become: yes
+
+# - name: Set userid
+#   command: targetcli /iscsi/"{{ iscsi_target_iqn }}"/tpg1 set auth userid=otus
+#   become: yes
+
+# - name: Set password
+#   command: targetcli /iscsi/"{{ iscsi_target_iqn }}"/tpg1 set auth password=otus
+#   become: yes
+
+- name: Set ALC1
+  command: targetcli  /iscsi/{{ iscsi_target_iqn }}/tpg1/acls  create "{{ node1_iqn }}"
+  become: yes
+
+- name: Set ALC2
+  command: targetcli  /iscsi/{{ iscsi_target_iqn }}/tpg1/acls  create "{{ node2_iqn }}"
+  become: yes
+
+# - name: Set ALC3
+#   command: targetcli  /iscsi/"{{ iscsi_target_iqn }}"/tpg1/acls  create iqn.2024-06.com.example:node3.33333333
+#   become: yes
+
+- name: Save LIO configuration
+  command: targetcli saveconfig
+  become: yes

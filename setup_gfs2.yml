@@ -1,0 +1,8 @@
+---
+- hosts: nodes
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: Include gfs2_client role
+      include_role:
+        name: gfs2_client

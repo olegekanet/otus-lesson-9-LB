@@ -15,7 +15,7 @@ variable "v4_cidr_blocks_default" {
 }
 
 variable "nginx_static_ips" {
-  description = "iscsi_static_ip"
+  description = "nginx_static_ip"
   default     = ["10.5.0.101", "10.5.0.102"]
 }
 

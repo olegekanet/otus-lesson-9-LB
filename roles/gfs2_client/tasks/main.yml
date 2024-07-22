@@ -1,0 +1,263 @@
+---
+- name: Update apt cache
+  apt:
+    update_cache: yes
+  tags:
+    - always
+
+- name: Ensure 'universe' repository is enabled
+  apt_repository:
+    repo: 'deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_release }} universe'
+    state: present
+
+- name: Install required packages
+  apt:
+    name:
+      - open-iscsi
+      - lvm2
+      - gfs2-utils
+      - dlm-controld
+      - lvm2-lockd
+      - fence-agents
+      - resource-agents
+      - python3
+      - python3-pip
+      - libruby3.0 
+      - ruby3.0
+      - pacemaker
+      - pcs
+    state: present
+
+- name: Enable and start DLM service
+  systemd:
+    name: dlm
+    enabled: yes
+    state: started
+
+- name: Set ansible_python_interpreter to /usr/bin/python3
+  set_fact:
+    ansible_python_interpreter: /usr/bin/python3
+
+- name: Set iSCSI InitiatorName for node1
+  when: inventory_hostname in groups['node1']
+  lineinfile:
+    path: /etc/iscsi/initiatorname.iscsi
+    regexp: "^InitiatorName=.*"
+    line: "InitiatorName={{ node1_iqn }}"
+
+- name: Set iSCSI InitiatorName for node2
+  when: inventory_hostname in groups['node2']
+  lineinfile:
+    path: /etc/iscsi/initiatorname.iscsi
+    regexp: "^InitiatorName=.*"
+    line: "InitiatorName={{ node2_iqn }}"
+
+
+- name: Add node entries to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ item }}"
+  with_items:
+    - "10.5.0.11 node1"
+    - "10.5.0.12 node2"
+
+- name: Set hostname1
+  when: inventory_hostname in groups['node1']
+  hostname:
+    name: "node1"
+
+- name: Set hostname2
+  when: inventory_hostname in groups['node2']
+  hostname:
+    name: "node2"
+
+- name: Start and enable iscsid service
+  service:
+    name: open-iscsi
+    state: started
+    enabled: yes
+
+- name: Discover iSCSI targets
+  command: iscsiadm -m discovery -t sendtargets -p {{ iscsi_server_ip }}
+  register: discovery_result
+  ignore_errors: yes
+
+- name: Debug discovery result
+  debug:
+    var: discovery_result
+
+- name: Ensure discovery was successful
+  fail:
+    msg: "iSCSI target discovery failed"
+  when: discovery_result.rc != 0
+
+- name: Logout from existing iSCSI sessions (if any)
+  command: iscsiadm -m node -T {{ iscsi_target_iqn }} --logout
+  ignore_errors: yes
+
+- name: Login to iSCSI target
+  command: iscsiadm -m node -T {{ iscsi_target_iqn }} --login
+  when: discovery_result.rc == 0
+
+- name: Wait for iSCSI device to be available {{ iscsi_device }}
+  wait_for:
+    path: "{{ iscsi_device }}"
+    state: present
+    timeout: 30
+  ignore_errors: true
+
+- name: Enable and start PCS service
+  systemd:
+    name: pcsd.service
+    enabled: yes
+    state: started
+
+- name: Upgrade pexpect using pip3
+  pip:
+    name: pexpect
+    executable: pip3
+    state: latest
+
+- name: Set password for hacluster user
+  ansible.builtin.expect:
+    command: passwd hacluster
+    responses:
+      "New password:": "{{ hacluster_pass }}\n"
+      "Retype new password:": "{{ hacluster_pass }}\n"
+
+- name: Copy corosync configuration file
+  template:
+    src: corosync.conf.j2
+    dest: /etc/corosync/corosync.conf
+
+- name: Create log directory for corosync
+  file:
+    path: /var/log/corosync/
+    state: directory
+
+- name: Start and enable corosync service
+  systemd:
+    name: corosync
+    enabled: yes
+    state: started
+
+- name: Start and enable pacemaker service
+  systemd:
+    name: pacemaker
+    enabled: yes
+    state: started
+
+- name: Start and enable lvmlockd service
+  systemd:
+    name: lvmlockd
+    enabled: yes
+    state: started
+
+- name: Authenticate cluster nodes
+  shell: pcs host auth -u hacluster -p '{{ hacluster_pass }}' node1 node2 
+  when: inventory_hostname in groups['node1']
+
+- name: Set up cluster
+  shell: pcs cluster setup otuscluster node1 node2 --force
+  when: inventory_hostname in groups['node1']
+
+- name: Enable all cluster resources
+  shell: "pcs cluster enable --all"
+  when: inventory_hostname in groups['node1']
+
+- name: Start all cluster resources
+  shell: "pcs cluster start --all"
+  when: inventory_hostname in groups['node1']
+
+- name: Disable STONITH
+  command: pcs property set stonith-enabled=false
+  when: inventory_hostname in groups['node1']
+
+- name: Set no-quorum policy to freeze
+  command: pcs property set no-quorum-policy=freeze
+  when: inventory_hostname in groups['node1']
+
+- name: Create DLM resource
+  command: pcs resource create dlm systemd:dlm op monitor interval=30s on-fail=ignore clone interleave=true ordered=true
+  ignore_errors: yes
+  when: inventory_hostname in groups['node1']
+
+- name: Create LVM2-LockD resource
+  command: pcs resource create lvmlockd systemd:lvmlockd op monitor interval=30s on-fail=ignore clone interleave=true
+  ignore_errors: yes
+  when: inventory_hostname in groups['node1']
+
+- name: Order DLM and LVM2-LockD resources
+  command: pcs constraint order start dlm-clone then lvmlockd-clone
+  ignore_errors: yes
+  when: inventory_hostname in groups['node1']
+
+# - name: Create CLVMd resource
+#   command: pcs resource create clvmd ocf:heartbeat:clvm op monitor interval=30s on-fail=ignore clone interleave=true ordered=true
+#   ignore_errors: yes
+#   when: inventory_hostname in groups['node1']
+
+# - name: Order DLM and CLVMd resources
+#   command: pcs constraint order start dlm-clone then clvmd-clone
+#   ignore_errors: yes
+#   when: inventory_hostname in groups['node1']
+
+- name: Check cluster resources status
+  command: pcs status resources
+  when: inventory_hostname in groups['node1']
+
+- name: Create Physical Volume on iSCSI device
+  command: pvcreate -ff -y {{ iscsi_device }}
+  ignore_errors: yes
+  when: inventory_hostname in groups['node1']
+
+- name: Create Volume Group
+  command: vgcreate -Ay cluster_vg {{ iscsi_device }}
+  ignore_errors: yes
+  when: inventory_hostname in groups['node1']
+
+- name: Create Logical Volume
+  command: lvcreate -L900M -n cluster_lv cluster_vg
+  ignore_errors: yes
+  when: inventory_hostname in groups['node1']
+
+- name: Create GFS2 filesystem
+  command: mkfs.gfs2 -j2 -p lock_dlm -t otuscluster:gfs2 /dev/mapper/cluster_vg-cluster_lv -O
+  ignore_errors: yes
+  when: inventory_hostname in groups['node1']
+
+# - name: Wipe filesystem signatures on cluster logical volume
+#   command: wipefs -a /dev/mapper/cluster_vg-cluster_lv
+#   ignore_errors: yes
+#   when: inventory_hostname in groups['node1']
+
+# - name: Check for bad blocks on cluster logical volume
+#   command: badblocks -v /dev/mapper/cluster_vg-cluster_lv
+#   ignore_errors: yes
+#   when: inventory_hostname in groups['node1']
+
+- name: Create clusterfs resource
+  command: pcs resource create clusterfs Filesystem device="/dev/mapper/cluster_vg-cluster_lv" directory="{{ root_html }}" fstype="gfs2" options="noatime" op monitor interval=10s on-fail=ignore clone interleave=true
+  when: inventory_hostname in groups['node1']
+
+
+- name: Order DLM and clusterfs resources
+  command: pcs constraint order start dlm-clone then clusterfs-clone
+  when: inventory_hostname in groups['node1']
+
+- name: Order LVM2-LockD and clusterfs resources
+  command: pcs constraint order start lvmlockd-clone then clusterfs-clone
+  when: inventory_hostname in groups['node1']
+
+- name: Set colocation of clusterfs and DLM
+  command: pcs constraint colocation add clusterfs-clone with dlm-clone
+  when: inventory_hostname in groups['node1']
+
+- name: Set colocation of clusterfs and LVM2-LockD
+  command: pcs constraint colocation add clusterfs-clone with lvmlockd-clone
+  when: inventory_hostname in groups['node1']
+
+- name: Restart Pacemaker service
+  ansible.builtin.systemd:
+    name: pacemaker
+    state: restarted

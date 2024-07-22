@@ -20,3 +20,15 @@ wp_sha1sum: 4e3501cf504b1004868d57f6b4173c68fd798415
 #false = Development, minor, and major updates are all disabled
 #minor = Minor updates are enabled, development, and major updates are disabled
 core_update_level: true
+
+
+iscsi_device_server: /dev/vdb
+
+hacluster_pass: 000ddd
+iscsi_device: /dev/sda
+iscsi_server_ip: "10.5.0.200"
+iscsi_target_iqn: "iqn.2024-06.com.example:storage.target1"
+node1_iqn: "iqn.2024-06.com.example:node1.11111111"
+node2_iqn: "iqn.2024-06.com.example:node2.22222222"
+
+root_html: /usr/share/nginx/html

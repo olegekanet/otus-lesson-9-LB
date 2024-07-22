@@ -133,6 +133,12 @@ resource "yandex_compute_instance" "vm_backend" {
   }
 }
 
+# Создание дополнительного диска для iscsi
+resource "yandex_compute_disk" "iscsi_disk" {
+  zone = var.yandex_zone
+  size = 10 # Размер диска в гигабайтах
+  type = "network-hdd"
+}
 
 resource "yandex_compute_instance" "vm_db" {
   depends_on = [
@@ -166,37 +172,42 @@ resource "yandex_compute_instance" "vm_db" {
     managered   = "terraform"
     lesson      = "9-lb"
   }
+
+  # вставляем iscsi_disk на машину с БД для экономии ресурсов 
+  secondary_disk {
+    disk_id = yandex_compute_disk.iscsi_disk.id
+  }
+
 }
 
 # Создание файла hosts с указанием пути к приватному ключу SSH
 resource "local_file" "hosts_file" {
   filename = "${path.module}/hosts"
   content  = <<-EOT
-    [nginx]
-    %{for idx in range(var.nginx_count)~}
-    ${yandex_compute_instance.vm_nginx[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
-    %{endfor~}
+[nginx]
+%{for idx in range(var.nginx_count)~}
+${yandex_compute_instance.vm_nginx[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
+%{endfor~}
 
-    %{for idx in range(var.nginx_count)~}
-    [nginx${idx + 1}]
-    ${yandex_compute_instance.vm_nginx[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
-    %{endfor~}
+%{for idx in range(var.nginx_count)~}
+[nginx${idx + 1}]
+${yandex_compute_instance.vm_nginx[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
+%{endfor~}
 
+[nodes]
+%{for idx in range(var.node_count)~}
+${yandex_compute_instance.vm_backend[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
+%{endfor~}
 
-    [nodes]
-    %{for idx in range(var.node_count)~}
-    ${yandex_compute_instance.vm_backend[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
-    %{endfor~}
+%{for idx in range(var.node_count)~}
+[node${idx + 1}]
+${yandex_compute_instance.vm_backend[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
+%{endfor~}
 
-    %{for idx in range(var.node_count)~}
-    [node${idx + 1}]
-    ${yandex_compute_instance.vm_backend[idx].network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
-    %{endfor~}
+[db]
+${yandex_compute_instance.vm_db.network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
 
-    [db]
-    ${yandex_compute_instance.vm_db.network_interface[0].nat_ip_address} ansible_ssh_user=ubuntu ansible_ssh_private_key_file="${path.module}/id_rsa"
-
-  EOT
+EOT
 }
 
 # Определение ресурса null_resource для провижининга
@@ -277,6 +288,9 @@ resource "null_resource" "ansible_provisioner_db" {
   provisioner "local-exec" {
     command = "ANSIBLE_HOST_KEY_CHECKING=false ansible-playbook -i '${path.module}/hosts' -l db ${path.module}/playbook_mysql.yml"
   }
+  provisioner "local-exec" {
+    command = "ANSIBLE_HOST_KEY_CHECKING=false ansible-playbook -i '${path.module}/hosts' -l db ${path.module}/setup_iscsi.yml"
+  }
 }
 
 # Определение ресурса null_resource для провижининга
@@ -284,15 +298,20 @@ resource "null_resource" "ansible_provisioner_backend" {
   # Этот ресурс не представляет собой реальный ресурс, а используется только для провижионинга
   # Мы указываем зависимость от других ресурсов, чтобы Terraform выполнил этот ресурс после создания других ресурсов
   depends_on = [
-    yandex_compute_instance.vm_backend
+    yandex_compute_instance.vm_backend,
+    null_resource.ansible_provisioner_db
   ]
   provisioner "local-exec" {
     command = "sleep 60" # Пауза в 60 секунд (1 минута)
   }
   # Команда, которая будет выполнена локально после создания ресурсов
   provisioner "local-exec" {
+    command = "ANSIBLE_HOST_KEY_CHECKING=false ansible-playbook -i '${path.module}/hosts' -l nodes ${path.module}/setup_gfs2.yml"
+  }
+  provisioner "local-exec" {
     command = "ANSIBLE_HOST_KEY_CHECKING=false ansible-playbook -i '${path.module}/hosts' -l nodes ${path.module}/playbook_project.yml"
   }
+
 }
 
 
